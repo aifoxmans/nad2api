@@ -40,7 +40,7 @@ def _attachment(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_video_param(normalized: dict[str, Any], assets: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    prompt = bind_prompt(normalized["prompt"], assets)
+    prompt = bind_prompt(normalized["prompt"], assets, sources=normalized)
     ordered = [item for kind in ("images", "videos", "audios") for item in assets[kind]]
     params: dict[str, Any] = {
         "description": prompt, "image": [item["url"] for item in ordered],

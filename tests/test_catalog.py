@@ -41,3 +41,27 @@ def test_full_seedance_and_vidu_standard_seedance_content():
 def test_reject_unsupported_combinations_before_upload(body, match):
     with pytest.raises(ValueError, match=match):
         normalize_request({"prompt": "sunrise", **body})
+
+
+@pytest.mark.parametrize("body,match", [
+    ({"model": "sd-2-0-mini", "image_urls": [f"https://media.example.test/{n}.jpg" for n in range(9)],
+      "prompt": "参考图片：https://media.example.test/extra.jpg"}, "at most 9 images"),
+    ({"model": "vidu-q4-540p", "prompt": "参考视频：https://media.example.test/clip.mp4"}, "at most 0 videos"),
+    ({"model": "kling-4.0", "prompt": "音频链接：https://media.example.test/audio.mp3"}, "at most 0 audios"),
+    ({"model": "sd-2-0-fast", "mode": "t2v", "prompt": "reference video: https://media.example.test/clip.mp4"}, "t2v cannot include"),
+    ({"model": "sd-2-0-fast", "mode": "i2v", "image_urls": ["https://media.example.test/image.jpg"],
+      "prompt": "参考视频：https://media.example.test/clip.mp4"}, "supports only images"),
+    ({"model": "sd-2-0-fast", "duration": 16, "prompt": "参考视频：https://media.example.test/clip.mp4"}, "duration must be"),
+])
+def test_inline_supplement_runs_all_existing_capability_checks(body, match):
+    with pytest.raises(ValueError, match=match):
+        normalize_request(body)
+
+
+def test_inline_links_never_reorder_or_duplicate_declared_media():
+    urls = ["https://media.example.test/a.mp4", "https://media.example.test/b.mp4"]
+    body = {"model": "sd-2-0-fast", "video_urls": list(urls),
+            "prompt": f"参考视频：{urls[1]}、{urls[0]}、https://media.example.test/c.mp4"}
+    normalized = normalize_request(body)
+    assert normalized["videos"] == urls + ["https://media.example.test/c.mp4"]
+    assert body["video_urls"] == urls

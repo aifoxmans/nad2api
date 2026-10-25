@@ -27,6 +27,25 @@ def test_submit_body_binds_all_materials_and_preserves_standard_options():
     assert body["input"]["content"] == param["description"]
 
 
+def test_inline_sources_are_bound_to_uploaded_assets_in_full_upstream_body():
+    image, video = "https://source.example.test/image1.jpg", "https://source.example.test/video2.mp4?sig=abc%2Fdef%3D&x="
+    caller = {"model": "sd-2-0-fast", "duration": 15, "resolution": "720p", "aspect_ratio": "9:16",
+              "image_urls": [image], "prompt": f"参考视频：({video})\n再次使用 {video}\n{image}"}
+    original = json.loads(json.dumps(caller))
+    normalized = normalize_request(caller)
+    assets = {"images": [{"url": "https://uploaded.example.test/image.jpg", "width": 1080, "height": 1440}],
+              "videos": [{"url": "https://uploaded.example.test/video.mp4", "duration": 4}], "audios": []}
+    param = build_video_param(normalized, assets)
+    body = build_submit_body(param, assets, mode=normalized["mode"])
+    assert caller == original
+    assert param["image"] == [assets["images"][0]["url"], assets["videos"][0]["url"]]
+    assert [item["url"] for item in body["input"]["attachments"]] == param["image"]
+    assert param["description"].count('data-type="reference-tag"') == 3
+    assert image not in param["description"] and video not in param["description"]
+    assert body["input"]["content"] == param["description"]
+    assert body["input"]["userParams"]["taskType"] == "MULTI_REF_IMG2VIDEO"
+
+
 def test_generation_network_failure_is_never_retried():
     api = client()
     api.session.request = Mock(side_effect=requests.Timeout("test"))

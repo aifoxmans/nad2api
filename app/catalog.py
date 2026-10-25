@@ -6,6 +6,7 @@ import html
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,83 @@ MODELS = {spec.id: spec for spec in (
 
 RATIOS = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
 ALIASES = re.compile(r"(?<![A-Za-z0-9_])(?P<explicit>@)?(?P<kind>视频|video|v|视|图片|image|img|图|音频|audio|音)\s*(?P<index>\d+)(?![A-Za-z0-9_])", re.I)
+MEDIA_URL = re.compile(r"https?://[^\s<>\"'\u2018\u2019\u201c\u201d\u3000\u3001\uff0c\u3002\uff1b\uff01\uff1f\uff1a【】（）《》]+", re.I)
+REFERENCE_LABEL = re.compile(
+    r"参考(?P<zh_reference>视频|图片|音频)|(?P<zh_link>视频|图片|音频)链接|"
+    r"reference\s+(?P<english>video|image|audio)\b", re.I)
+REFERENCE_JOINERS = re.compile(r"(?:链接|地址|如下|分别|为|是|及|和|或|的|urls?|links?|and|or)", re.I)
+MEDIA_EXTENSIONS = {
+    "images": {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "heic", "heif", "tif", "tiff"},
+    "videos": {"mp4", "mov", "webm", "m4v", "mkv", "avi", "3gp", "flv"},
+    "audios": {"mp3", "wav", "m4a", "aac", "ogg", "opus", "flac", "aiff", "aif", "wma"},
+}
+
+
+def _url_spans(prompt: str) -> list[tuple[int, int, str]]:
+    """Find whole URL tokens without decoding or rewriting signed queries."""
+    result = []
+    for match in MEDIA_URL.finditer(prompt):
+        value = match.group(0)
+        # Markdown/prose closing brackets are outside the URL when unbalanced.
+        previous = None
+        while value != previous:
+            previous = value
+            for opening, closing in (("(", ")"), ("[", "]"), ("{", "}"), ("（", "）"), ("【", "】"), ("《", "》")):
+                while value.endswith(closing) and value.count(closing) > value.count(opening):
+                    value = value[:-1]
+        # A query is opaque: punctuation can be part of its signature. For
+        # unsigned bare links only, remove ordinary sentence/list punctuation.
+        if "?" not in value and "#" not in value:
+            value = value.rstrip(".,;!:")
+        if value:
+            result.append((match.start(), match.start() + len(value), value))
+    return result
+
+
+def _plain_segments(prompt: str):
+    end = 0
+    for start, stop, value in _url_spans(prompt):
+        yield False, prompt[end:start]
+        yield True, value
+        end = stop
+    yield False, prompt[end:]
+
+
+def _supplement_prompt_media(prompt: str, media: dict[str, list[str]]) -> None:
+    """Import direct media links only under an explicit reference-media label."""
+    spans = _url_spans(prompt)
+    labels = list(REFERENCE_LABEL.finditer(prompt))
+    declared = {url for values in media.values() for url in values}
+    for start, _, value in spans:
+        if value in declared:
+            continue
+        preceding = next((label for label in reversed(labels) if label.end() <= start), None)
+        if preceding is None:
+            continue
+        between = prompt[preceding.end():start]
+        # Permit a list of links after one label, including wrapped lines. Any
+        # intervening prose or a different field prevents implicit extraction.
+        for prior_start, prior_end, _ in reversed(spans):
+            if preceding.end() <= prior_start and prior_end <= start:
+                relative = prior_start - preceding.end()
+                between = between[:relative] + between[prior_end - preceding.end():]
+        between = REFERENCE_JOINERS.sub("", between)
+        if re.search(r"[^\s\d:：=,，.。;；!！?？、|/\\()（）\[\]{}<>【】《》“”‘’*`\-]", between):
+            continue
+        label = preceding.group("zh_reference") or preceding.group("zh_link") or preceding.group("english")
+        kind = {"视频": "videos", "图片": "images", "音频": "audios",
+                "video": "videos", "image": "images", "audio": "audios"}[label.lower()]
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            continue
+        if not parsed.hostname or parsed.username or parsed.password:
+            continue
+        extension = unquote(parsed.path).rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower()
+        if extension not in MEDIA_EXTENSIONS[kind]:
+            continue
+        media[kind].append(value)
+        declared.add(value)
 
 
 def media_alias_kind(label: str) -> str:
@@ -88,40 +166,56 @@ def media_alias_kind(label: str) -> str:
 
 def prompt_references(prompt: str, media: dict[str, list[Any]]) -> list[tuple[str, int]]:
     found = []
-    for match in ALIASES.finditer(prompt):
-        kind, index = media_alias_kind(match.group("kind")), int(match.group("index"))
-        if not media[kind] and not match.group("explicit"):
+    for is_url, segment in _plain_segments(prompt):
+        if is_url:
             continue
-        if not 1 <= index <= len(media[kind]):
-            raise ValueError(f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
-        found.append((kind, index))
+        for match in ALIASES.finditer(segment):
+            kind, index = media_alias_kind(match.group("kind")), int(match.group("index"))
+            if not media[kind] and not match.group("explicit"):
+                continue
+            if not 1 <= index <= len(media[kind]):
+                raise ValueError(f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
+            found.append((kind, index))
     return found
 
 
-def bind_prompt(prompt: str, assets: dict[str, list[Any]]) -> str:
+def bind_prompt(prompt: str, assets: dict[str, list[Any]], sources: dict[str, Any] | None = None) -> str:
     """Build the same escaped reference-tag HTML that the web composer submits."""
-    chunks: list[str] = []
-    end = 0
-    for match in ALIASES.finditer(prompt):
-        chunks.append(html.escape(prompt[end:match.start()]).replace("\n", "<br>"))
-        kind, index = media_alias_kind(match.group("kind")), int(match.group("index"))
-        if not assets[kind] and not match.group("explicit"):
-            chunks.append(html.escape(match.group(0)))
-        else:
-            if not 1 <= index <= len(assets[kind]):
-                raise ValueError(f"unbound media reference: {match.group(0)}")
-            asset = assets[kind][index - 1]
-            asset = asset if isinstance(asset, dict) else {"url": asset}
-            url = html.escape(str(asset["url"]), quote=True)
-            thumb = html.escape(str(asset.get("thumbnailUrl") or ""), quote=True)
-            label = {"images": "图片", "videos": "视频", "audios": "音频"}[kind] + str(index)
-            image = f'<img src="{thumb}" class="reference-tag-thumbnail">' if thumb else ""
-            chunks.append(f'<span data-type="reference-tag" data-value="{label}" data-url="{url}" '
-                          f'data-thumbnail-url="{thumb}" class="reference-tag image-tag" '
-                          f'data-id="nad-{kind}-{index}" value="{label}" url="{url}" thumbnailurl="{thumb}">'
-                          f'{image}<span class="reference-tag-text">@{label}</span></span>')
-        end = match.end()
-    chunks.append(html.escape(prompt[end:]).replace("\n", "<br>"))
+    def reference(kind, index):
+        if not 1 <= index <= len(assets[kind]):
+            raise ValueError("unbound media reference")
+        asset = assets[kind][index - 1]
+        asset = asset if isinstance(asset, dict) else {"url": asset}
+        url = html.escape(str(asset["url"]), quote=True)
+        thumb = html.escape(str(asset.get("thumbnailUrl") or ""), quote=True)
+        label = {"images": "图片", "videos": "视频", "audios": "音频"}[kind] + str(index)
+        image = f'<img src="{thumb}" class="reference-tag-thumbnail">' if thumb else ""
+        return (f'<span data-type="reference-tag" data-value="{label}" data-url="{url}" '
+                f'data-thumbnail-url="{thumb}" class="reference-tag image-tag" '
+                f'data-id="nad-{kind}-{index}" value="{label}" url="{url}" thumbnailurl="{thumb}">'
+                f'{image}<span class="reference-tag-text">@{label}</span></span>')
+
+    known = {}
+    for kind in ("images", "videos", "audios"):
+        for index, source in enumerate((sources or {}).get(kind) or [], 1):
+            if isinstance(source, str):
+                known.setdefault(source, (kind, index))
+    chunks = []
+    for is_url, segment in _plain_segments(prompt):
+        if is_url:
+            bound = known.get(segment)
+            chunks.append(reference(*bound) if bound else html.escape(segment))
+            continue
+        end = 0
+        for match in ALIASES.finditer(segment):
+            chunks.append(html.escape(segment[end:match.start()]).replace("\n", "<br>"))
+            kind, index = media_alias_kind(match.group("kind")), int(match.group("index"))
+            if not assets[kind] and not match.group("explicit"):
+                chunks.append(html.escape(match.group(0)))
+            else:
+                chunks.append(reference(kind, index))
+            end = match.end()
+        chunks.append(html.escape(segment[end:]).replace("\n", "<br>"))
     return "<p>" + "".join(chunks) + "</p>"
 
 
@@ -175,6 +269,7 @@ def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("prompt is required")
     if len(prompt) > (5000 if spec.family == "vidu" else 7000 if spec.family == "minimax" else 10000):
         raise ValueError("prompt exceeds this upstream model's limit")
+    _supplement_prompt_media(prompt, media)
     raw_duration = body.get("duration", body.get("seconds", spec.min_duration))
     if isinstance(raw_duration, bool) or not str(raw_duration).isdigit():
         raise ValueError("duration must be an integer number of seconds")

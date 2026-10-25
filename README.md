@@ -42,6 +42,8 @@ The response contains a `nad_...` task ID. Query `GET /v1/videos/{id}` until com
 
 Prompt aliases such as `视频1`, `video2`, `v3`, `视4`, `图片1`, `图1`, `img2`, `Image3`, `Audio1`, and `音频2` are converted into the upstream web composer's reference tags. References remain one-based within each media type. Out-of-range references are rejected before generation. Material limits are enforced before upload, and duration checks use returned upload metadata.
 
+Direct media URLs explicitly labeled as reference images, videos, or audio in the prompt are included in the corresponding material list before model limits are checked. Repeated links reuse the same material; links already supplied in the material fields are not added again. Matching source URLs in the prompt are bound to the uploaded upstream references. Ordinary webpage links remain text. Prefer the explicit `image_urls`, `video_urls`, and `audio_urls` fields for unambiguous requests.
+
 An idempotency key belongs to one normalized request. Reusing it for a different request is rejected. A generation submission is never retried after an ambiguous network error. `submission_unknown` means the original task requires verification; it must not trigger automatic failover or a second generation. If original task IDs are available, administrators can use `POST /api/tasks/{id}/resume` to resume querying that same task.
 
 ## Models
