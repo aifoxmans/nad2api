@@ -1,7 +1,7 @@
 import hashlib
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -11,6 +11,22 @@ from app.browser import BrowserRejected
 from app.catalog import normalize_request
 from app.client import GRAPH, NadClient, NadError, build_submit_body, build_video_param, extract_result_urls
 from app.media import CHUNK_THRESHOLD, upload_media_bytes, validate_material_durations
+
+
+def test_material_failure_identifies_type_and_index_without_source_url(monkeypatch):
+    from app.media import MediaError
+    api = client()
+    calls = []
+    def prepare(source, kind, account_id):
+        calls.append((kind, account_id))
+        if len(calls) == 2:
+            raise MediaError("reference download failed: headers ReadTimeout bytes=0")
+        return {"url": "https://cdn.example.test/one.png"}
+    monkeypatch.setattr(api, "_upload_input", prepare)
+    n = normalize_request({"prompt": "lake", "image_urls": ["https://private.example.test/one.png?token=one", "https://private.example.test/two.png?token=two"]})
+    with pytest.raises(MediaError, match=r"images\[2\]: reference download failed") as raised:
+        api.upload_inputs(n)
+    assert "token=" not in str(raised.value) and "https://" not in str(raised.value)
 from app.store import Store
 
 
@@ -281,9 +297,11 @@ def material_slots(monkeypatch):
     monkeypatch.setattr(module, "_MATERIAL_PREPARATION_SLOTS", preparation)
     monkeypatch.setattr(module, "_MATERIAL_UPLOAD_SLOTS", uploads)
     monkeypatch.setattr(module, "_MEDIA_CACHE_LOCKS", {})
+    monkeypatch.setattr(module, "_MEDIA_SOURCE_FLIGHTS", {})
     yield preparation, uploads
     _assert_slots_available(preparation, 4)
     _assert_slots_available(uploads, 2)
+    assert module._MEDIA_SOURCE_FLIGHTS == {}
 
 
 def _material_client(store, account_id=1):
@@ -333,7 +351,9 @@ def test_same_account_and_digest_share_one_completed_upload(monkeypatch, tmp_pat
     monkeypatch.setattr("app.client._download", download)
     monkeypatch.setattr("app.client.upload_media_bytes", upload)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = [pool.submit(api.upload_inputs, _material_request(images=["source"])) for api in clients]
+        # Distinct source URLs with identical bytes still share the digest cache.
+        futures = [pool.submit(api.upload_inputs, _material_request(images=[f"source{index}"]))
+                   for index, api in enumerate(clients)]
         results = [future.result(timeout=8) for future in futures]
     assert results[0] == results[1] and upload.call_count == 1
     monkeypatch.setattr("app.client._download", lambda *args: (b"same image", "image/png", "r.png"))
@@ -484,3 +504,152 @@ def test_material_order_and_compliance_are_outside_upload_slots(monkeypatch, tmp
     result = api.upload_inputs(normalized)
     assert [item["url"] for kind in result for item in result[kind]] == expected
     assert api.request.call_count == 1
+
+
+def _observe_source_waiters(monkeypatch, expected):
+    waiting = threading.Event()
+    guard = threading.Lock()
+    count = 0
+
+    class ObservedFuture(Future):
+        def result(self, *args, **kwargs):
+            nonlocal count
+            with guard:
+                count += 1
+                if count == expected:
+                    waiting.set()
+            return super().result(*args, **kwargs)
+
+    monkeypatch.setattr("app.client.Future", ObservedFuture)
+    return waiting
+
+
+def test_concurrent_same_source_downloads_and_uploads_once_without_waiter_slots(monkeypatch, tmp_path, material_slots):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store), _material_client(store)]
+    owner_started, release_owner = threading.Event(), threading.Event()
+    waiter_started = _observe_source_waiters(monkeypatch, 1)
+
+    def download(*args):
+        owner_started.set()
+        assert release_owner.wait(timeout=5)
+        return b"shared image", "image/png", "r.png"
+
+    download_mock = Mock(side_effect=download)
+    upload = Mock(side_effect=lambda data, mime, filename, kind, **kwargs: _material_receipt(data, kind))
+    monkeypatch.setattr("app.client._download", download_mock)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    request = _material_request(images=["https://source.example.test/image.png?sig=one%2Ftwo&expires=123"])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(clients[0].upload_inputs, request)
+        try:
+            assert owner_started.wait(timeout=5)
+            waiter = pool.submit(clients[1].upload_inputs, request)
+            assert waiter_started.wait(timeout=5)
+            _assert_slots_available(material_slots[0], 3)
+            _assert_slots_available(material_slots[1], 2)
+            assert download_mock.call_count == 1
+        finally:
+            release_owner.set()
+        first, second = owner.result(timeout=8), waiter.result(timeout=8)
+    assert first == second and download_mock.call_count == upload.call_count == 1
+    assert first["images"][0] is not second["images"][0]
+    first["images"][0]["url"] = "changed"
+    assert second["images"][0]["url"].startswith("https://")
+
+
+@pytest.mark.parametrize("other_account,other_kind,other_query", [
+    (2, "images", "sig=one%2Ftwo&expires=123"),
+    (1, "videos", "sig=one%2Ftwo&expires=123"),
+    (1, "images", "sig=one%2Ftwo&expires=456"),
+    (1, "images", "sig=one/two&expires=123"),
+])
+def test_source_flights_isolate_accounts_types_and_complete_signed_query(monkeypatch, tmp_path, material_slots,
+                                                                      other_account, other_kind, other_query):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store), _material_client(store, other_account)]
+    both_downloads = threading.Barrier(2)
+
+    def download(source, kind, proxy):
+        both_downloads.wait(timeout=5)
+        return source.encode(), "image/png", "r.png"
+
+    download_mock = Mock(side_effect=download)
+    upload = Mock(side_effect=lambda data, mime, filename, kind, *, client:
+                  _material_receipt(data, kind, client.account["id"]))
+    monkeypatch.setattr("app.client._download", download_mock)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    base = "https://source.example.test/reference?"
+    requests = [_material_request(images=[base + "sig=one%2Ftwo&expires=123"]),
+                _material_request(**{other_kind: [base + other_query]})]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(api.upload_inputs, request) for api, request in zip(clients, requests)]
+        results = [future.result(timeout=8) for future in futures]
+    assert all(result for result in results) and download_mock.call_count == upload.call_count == 2
+
+
+def test_completed_source_flight_is_not_a_cache_for_mutable_urls(monkeypatch, tmp_path, material_slots):
+    api = _material_client(Store(str(tmp_path / "cache.db")))
+    download = Mock(side_effect=[(b"old content", "image/png", "r.png"),
+                                 (b"new content", "image/png", "r.png"),
+                                 (b"new content", "image/png", "r.png")])
+    upload = Mock(side_effect=lambda data, mime, filename, kind, **kwargs: _material_receipt(data, kind))
+    monkeypatch.setattr("app.client._download", download)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    request = _material_request(images=["https://source.example.test/mutable.png"])
+    first, second, third = [api.upload_inputs(request) for _ in range(3)]
+    assert first != second and second == third
+    assert download.call_count == 3 and upload.call_count == 2
+
+
+@pytest.mark.parametrize("phase", ["download", "upload", "cache"])
+def test_failed_source_owner_fails_all_waiters_and_leaves_no_inflight_state(monkeypatch, tmp_path, material_slots, phase):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store) for _ in range(3)]
+    owner_started, release_owner = threading.Event(), threading.Event()
+    waiters_started = _observe_source_waiters(monkeypatch, 2)
+    fail_owner = True
+    original_put = store.media_cache_put
+
+    def fail_in_phase(current):
+        if fail_owner and phase == current:
+            owner_started.set()
+            assert release_owner.wait(timeout=5)
+            raise RuntimeError("owner preparation failed")
+
+    def download(*args):
+        fail_in_phase("download")
+        return b"shared material", "image/png", "r.png"
+
+    def upload(data, mime, filename, kind, **kwargs):
+        fail_in_phase("upload")
+        return _material_receipt(data, kind)
+
+    def put(*args):
+        fail_in_phase("cache")
+        return original_put(*args)
+
+    download_mock, upload_mock = Mock(side_effect=download), Mock(side_effect=upload)
+    monkeypatch.setattr("app.client._download", download_mock)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload_mock)
+    monkeypatch.setattr(store, "media_cache_put", put)
+    request = _material_request(images=["https://source.example.test/shared.png"])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        owner = pool.submit(clients[0].upload_inputs, request)
+        try:
+            assert owner_started.wait(timeout=5)
+            waiters = [pool.submit(api.upload_inputs, request) for api in clients[1:]]
+            assert waiters_started.wait(timeout=5)
+            assert download_mock.call_count == 1
+        finally:
+            release_owner.set()
+        for future in [owner, *waiters]:
+            with pytest.raises(RuntimeError, match="owner preparation failed"):
+                future.result(timeout=8)
+    assert download_mock.call_count == 1
+    assert upload_mock.call_count == (0 if phase == "download" else 1)
+    for semaphore, limit in zip(material_slots, (4, 2)):
+        _assert_slots_available(semaphore, limit)
+    fail_owner = False
+    assert clients[0].upload_inputs(request)["images"]
+    assert download_mock.call_count == 2

@@ -73,6 +73,8 @@ If an output reports only a generic artifact failure, the gateway checks that sa
 
 Tasks prepare their materials concurrently within the configured worker and account limits. A global limit of four material preparations and two uploads bounds network and memory use. Uploads of identical bytes share one receipt only within the same account and material type. Generation submission is never retried by these upload controls.
 
+Public reference files are fetched anonymously using a direct connection first, with the account proxy as a fallback for temporary download failures. Account verification, upstream uploads, generation, and polling continue to use the account proxy and its isolated authenticated session. Source GET attempts are bounded; partial files are discarded between attempts. Failures identify the material type, index, transport phase, and received byte count without exposing signed URLs. Overlapping requests for the same source share one preparation only within the same account and material type; later requests read the source again so mutable links are not cached indefinitely.
+
 ## GitHub Actions and preproduction
 
 `.github/workflows/deploy-test.yml` validates the application and builds/pushes its image on GitHub-hosted runners. The `nad2api-pre` self-hosted runner only pulls the published image, restarts this service, and configures the Cloudflared route. It does not build an image on the deployment host.

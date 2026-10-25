@@ -134,3 +134,14 @@ def test_operator_queue_cancellation_does_not_claim_generation_or_refund():
     error = public_error("QUEUE_CANCELLED", "operator cancelled before upstream submission; no generation request sent")
     assert error["message"] == "队列排队服务中断，请稍后再试~"
     assert "积分" not in error["message"]
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("host=copyright.example.test reason=read timeout", "素材下载失败，请检查素材链接后重试~"),
+    ("host=source.example.test reason=images reference has the wrong content type", "素材格式不支持，请修改后再试~"),
+    ("host=source.example.test reason=reference media exceeds 200 MB", "素材超限，请修改后再试~"),
+])
+def test_source_download_diagnostics_keep_validation_and_transport_categories(reason, expected):
+    result = public_error("MEDIAERROR", "images[6]: reference download failed: " + reason)
+    assert result["category"] == "invalid_request"
+    assert result["message"] == expected

@@ -7,6 +7,7 @@ import json
 import secrets
 import threading
 import time
+from concurrent.futures import Future
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -14,7 +15,7 @@ import requests
 
 from .browser import BASE, BrowserError, BrowserRejected, CDPBrowser, account_proxy_url
 from .catalog import bind_prompt
-from .media import _download, upload_media_bytes, validate_material_durations
+from .media import MediaError, _download, upload_media_bytes, validate_material_durations
 from .store import Store
 
 
@@ -23,6 +24,8 @@ _MEDIA_LOCKS_GUARD = threading.RLock()
 _MEDIA_LOCKS: dict[int, threading.RLock] = {}
 _MEDIA_CACHE_LOCKS_GUARD = threading.Lock()
 _MEDIA_CACHE_LOCKS: dict[tuple[int, str, str], threading.RLock] = {}
+_MEDIA_SOURCE_FLIGHTS_GUARD = threading.Lock()
+_MEDIA_SOURCE_FLIGHTS: dict[tuple[int, str, str], Future[dict[str, Any]]] = {}
 # Bound downloaded payloads separately from the actual upstream upload calls.
 # These slots are shared by all task clients; each client keeps its own session.
 _MATERIAL_PREPARATION_SLOTS = threading.BoundedSemaphore(4)
@@ -228,6 +231,33 @@ class NadClient:
     checkin = daily_checkin
 
     def _upload_input(self, source: str, kind: str, account_id: int) -> dict[str, Any]:
+        # Include the complete source, including signed query parameters. Only
+        # overlapping requests share a result; mutable URLs are read again later.
+        key = (account_id, kind, hashlib.sha256(source.encode("utf-8")).hexdigest())
+        with _MEDIA_SOURCE_FLIGHTS_GUARD:
+            flight = _MEDIA_SOURCE_FLIGHTS.get(key)
+            owner = flight is None or flight.done()
+            if owner:
+                flight = Future()
+                _MEDIA_SOURCE_FLIGHTS[key] = flight
+        if not owner:
+            # Wait without occupying a preparation slot or sharing this client's
+            # authenticated session with the owner.
+            return dict(flight.result())
+        try:
+            receipt = self._prepare_input(source, kind, account_id)
+        except BaseException as exc:
+            flight.set_exception(exc)
+            raise
+        else:
+            flight.set_result(receipt)
+            return dict(receipt)
+        finally:
+            with _MEDIA_SOURCE_FLIGHTS_GUARD:
+                if _MEDIA_SOURCE_FLIGHTS.get(key) is flight:
+                    del _MEDIA_SOURCE_FLIGHTS[key]
+
+    def _prepare_input(self, source: str, kind: str, account_id: int) -> dict[str, Any]:
         with _MATERIAL_PREPARATION_SLOTS:
             data = None
             try:
@@ -253,10 +283,13 @@ class NadClient:
         result: dict[str, list[dict[str, Any]]] = {"images": [], "videos": [], "audios": []}
         account_id = int(self.account["id"])
         for kind in result:
-            for source in normalized[kind]:
+            for index, source in enumerate(normalized[kind], 1):
                 # Each task retains the caller's order without sharing its session
                 # across threads; independent tasks prepare concurrently.
-                result[kind].append(self._upload_input(source, kind, account_id))
+                try:
+                    result[kind].append(self._upload_input(source, kind, account_id))
+                except MediaError as exc:
+                    raise MediaError(f"{kind}[{index}]: {exc}") from exc
         validate_material_durations(normalized, result)
         # Seedance web clients register all materials for compliance before
         # generation, preserving the normal upstream validation mechanism.

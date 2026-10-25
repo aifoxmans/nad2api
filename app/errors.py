@@ -13,6 +13,16 @@ def public_error(code: str, message: str) -> dict[str, str]:
     elif kind == "QUEUE_CANCELLED":
         public = "队列排队服务中断，请稍后再试~"
         category = "provider_unavailable"
+    elif "reference download failed:" in raw:
+        # Source transport diagnostics may contain arbitrary host names. Classify
+        # their validated reason before scanning upstream content-policy words.
+        if "reference media exceeds" in raw:
+            public = "素材超限，请修改后再试~"
+        elif "wrong content type" in raw:
+            public = "素材格式不支持，请修改后再试~"
+        else:
+            public = "素材下载失败，请检查素材链接后重试~"
+        category = "invalid_request"
     elif any(value in raw for value in ("真人", "real person", "real-person")):
         public = "参考图片中检测到可能存在真人，暂不支持，请更换图片后重试，积分已返还~"
         category = "content_policy"
