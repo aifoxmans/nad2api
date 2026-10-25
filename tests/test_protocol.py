@@ -1,5 +1,7 @@
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -9,6 +11,7 @@ from app.browser import BrowserRejected
 from app.catalog import normalize_request
 from app.client import GRAPH, NadClient, NadError, build_submit_body, build_video_param, extract_result_urls
 from app.media import CHUNK_THRESHOLD, upload_media_bytes, validate_material_durations
+from app.store import Store
 
 
 def client():
@@ -117,6 +120,102 @@ def test_poll_only_returns_completed_output_video_urls():
     assert extract_result_urls({"asset": {"videos": [{"status": "running", "url": "https://input.example.test/reference.mp4"}]}}) == []
 
 
+def artifact_failure_message(error="Generated video has copyright restrictions", *,
+                             path="/videos/asset-target", thread_id="s_example", stream_mode="updates",
+                             metadata_state="ERROR", role="main_director"):
+    location, _, filename = path.rpartition("/")
+    return {"thread_id": thread_id, "msg_index": 10, "data": {
+        "stream_mode": stream_mode, "status": "completed", "metadata": {"agent_role": role},
+        "content": {"_single_asset": {"status": "error", "notify_parts": [{
+            "filename": filename, "metadata": {"location": location, "state": metadata_state, "error": error},
+        }]}}}}
+
+
+def failed_artifact_poll(api, history, *, error="Artifact generation failed", path="/videos/asset-target"):
+    files = {"data": {"files": {"ui_state.json": [{"content": json.dumps({"asset": {
+        "videos": [{"status": "error", "error": error, "path": path}],
+    }})}]}}}
+    state = {"task_id": 100, "data": {"status": "SUCCEEDED"}}
+    api.request = Mock(side_effect=[files, state, history])
+    return api.poll("100", "s_example")
+
+
+def test_generic_artifact_failure_prefers_exact_asset_notification_cause():
+    api = client()
+    message = "Generated video has copyright restrictions"
+    history = {"data": {"turns": [{"messages": [artifact_failure_message(message)]}]}}
+    result = failed_artifact_poll(api, history)
+    assert result["status"] == "failed" and result["state"] == "SUCCEEDED"
+    assert result["error_code"] == "UPSTREAM_FAILED" and result["error"] == message
+    assert api.request.call_count == 3
+    call = api.request.call_args
+    assert call.args == ("GET", GRAPH + "/message_history")
+    assert call.kwargs == {"params": {"thread_id": "s_example", "limit": 5}, "timeout": (5, 10)}
+    assert not any(call.args[1].endswith("/ainvoke") for call in api.request.call_args_list)
+
+
+def test_history_network_failure_keeps_confirmed_artifact_failure():
+    api = client()
+    result = failed_artifact_poll(api, NadError("read timeout"))
+    assert result["status"] == "failed" and result["error_code"] == "UPSTREAM_FAILED"
+    assert result["error"] == "Artifact generation failed"
+    assert api.request.call_count == 3
+
+
+@pytest.mark.parametrize("history", [
+    {}, {"data": {"turns": []}}, {"data": {"turns": "invalid"}},
+    {"data": {"turns": [{"messages": [artifact_failure_message("Artifact generation failed")]}]}},
+])
+def test_history_without_specific_cause_preserves_generic_fallback(history):
+    api = client()
+    result = failed_artifact_poll(api, history)
+    assert result["status"] == "failed" and result["error"] == "Artifact generation failed"
+    assert api.request.call_count == 3
+
+
+@pytest.mark.parametrize("overrides", [
+    {"path": "/videos/older-unrelated-asset"}, {"thread_id": "s_other"},
+    {"stream_mode": "input"}, {"metadata_state": "COMPLETED"}, {"role": "user"},
+])
+def test_unrelated_old_failures_and_user_content_do_not_override_current_asset(overrides):
+    api = client()
+    history = {"data": {"turns": [{"messages": [artifact_failure_message(**overrides)]}]}}
+    result = failed_artifact_poll(api, history)
+    assert result["error"] == "Artifact generation failed" and result["status"] == "failed"
+
+
+def test_matching_current_failure_is_selected_instead_of_an_unrelated_older_failure():
+    api = client()
+    history = {"data": {"turns": [
+        {"messages": [artifact_failure_message("unrelated old error", path="/videos/old")]},
+        {"messages": [artifact_failure_message("current exact asset error")]},
+    ]}}
+    result = failed_artifact_poll(api, history)
+    assert result["error"] == "current exact asset error"
+
+
+@pytest.mark.parametrize("error,path", [
+    ("already specific upstream failure", "/videos/asset-target"),
+    ("Artifact generation failed", ""),
+])
+def test_specific_failures_or_missing_artifact_identity_do_not_request_history(error, path):
+    api = client()
+    result = failed_artifact_poll(api, {"data": {"turns": []}}, error=error, path=path)
+    assert result["error"] == error and result["status"] == "failed"
+    assert api.request.call_count == 2
+
+
+def test_running_video_never_requests_error_history():
+    api = client()
+    api.request = Mock(side_effect=[
+        {"data": {"files": {"ui_state.json": [{"content": json.dumps({
+            "asset": {"videos": [{"status": "running", "path": "/videos/asset-target"}]},
+        })}]}}}, {"task_id": 100, "data": {"status": "RUNNING"}},
+    ])
+    result = api.poll("100", "s_example")
+    assert result["status"] == "running" and api.request.call_count == 2
+
+
 def test_small_upload_preserves_metadata_duration_units():
     api = Mock()
     api.request.return_value = {"data": {"id": 7, "url": "https://material.example.test/audio.mp3",
@@ -159,4 +258,229 @@ def test_reward_needing_captcha_is_never_bypassed():
     api = client()
     api.request = Mock(return_value={"data": {"status": 1, "quotaExhausted": False}})
     assert api.daily_checkin()["manual_required"] is True
+    assert api.request.call_count == 1
+
+
+def _assert_slots_available(semaphore, count):
+    acquired = 0
+    try:
+        for _ in range(count):
+            assert semaphore.acquire(blocking=False)
+            acquired += 1
+    finally:
+        for _ in range(acquired):
+            semaphore.release()
+
+
+@pytest.fixture
+def material_slots(monkeypatch):
+    import app.client as module
+
+    preparation = threading.BoundedSemaphore(4)
+    uploads = threading.BoundedSemaphore(2)
+    monkeypatch.setattr(module, "_MATERIAL_PREPARATION_SLOTS", preparation)
+    monkeypatch.setattr(module, "_MATERIAL_UPLOAD_SLOTS", uploads)
+    monkeypatch.setattr(module, "_MEDIA_CACHE_LOCKS", {})
+    yield preparation, uploads
+    _assert_slots_available(preparation, 4)
+    _assert_slots_available(uploads, 2)
+
+
+def _material_client(store, account_id=1):
+    return NadClient({"id": account_id, "proxy_url": f"http://127.0.0.1:{9080 + account_id}",
+                      "cookie": f"session=account{account_id}", "dfp": f"device{account_id}"}, store=store)
+
+
+def _material_request(*, images=(), videos=(), audios=(), family="wan"):
+    return {"family": family, "images": list(images), "videos": list(videos), "audios": list(audios)}
+
+
+def _material_receipt(data, kind, account_id=1):
+    return {"url": f"https://material.example.test/{account_id}/{kind}/{data.hex()}",
+            "kind": kind, "duration": 3, "size": len(data)}
+
+
+def test_distinct_materials_for_one_account_upload_concurrently(monkeypatch, tmp_path, material_slots):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store), _material_client(store)]
+    assert clients[0].session is not clients[1].session
+    assert clients[0].session.cookies is not clients[1].session.cookies
+    overlap = threading.Barrier(2)
+    monkeypatch.setattr("app.client._download", lambda source, kind, proxy: (source.encode(), "image/png", "r.png"))
+
+    def upload(data, mime, filename, kind, *, client):
+        overlap.wait(timeout=5)
+        return _material_receipt(data, kind)
+
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(api.upload_inputs, _material_request(images=[source]))
+                   for api, source in zip(clients, ["first", "second"])]
+        results = [future.result(timeout=8) for future in futures]
+    assert results[0]["images"][0]["url"] != results[1]["images"][0]["url"]
+
+
+def test_same_account_and_digest_share_one_completed_upload(monkeypatch, tmp_path, material_slots):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store), _material_client(store)]
+    both_downloaded = threading.Barrier(2)
+
+    def download(source, kind, proxy):
+        both_downloaded.wait(timeout=5)
+        return b"same image", "image/png", "r.png"
+
+    upload = Mock(side_effect=lambda data, mime, filename, kind, **kwargs: _material_receipt(data, kind))
+    monkeypatch.setattr("app.client._download", download)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(api.upload_inputs, _material_request(images=["source"])) for api in clients]
+        results = [future.result(timeout=8) for future in futures]
+    assert results[0] == results[1] and upload.call_count == 1
+    monkeypatch.setattr("app.client._download", lambda *args: (b"same image", "image/png", "r.png"))
+    assert clients[0].upload_inputs(_material_request(images=["source"])) == results[0]
+    assert upload.call_count == 1
+    # One task cannot change the cached receipt used by another task.
+    results[0]["images"][0]["url"] = "changed"
+    digest = hashlib.sha256(b"same image").hexdigest()
+    assert store.media_cache_get(1, "images", digest)["url"].startswith("https://")
+
+
+@pytest.mark.parametrize("other_account,other_kind", [(2, "images"), (1, "videos")])
+def test_material_cache_never_crosses_account_or_kind(monkeypatch, tmp_path, material_slots,
+                                                    other_account, other_kind):
+    store = Store(str(tmp_path / "cache.db"))
+    clients = [_material_client(store), _material_client(store, other_account)]
+    proxies = []
+
+    def download(source, kind, proxy):
+        proxies.append(proxy)
+        return b"same bytes", "image/png", "r.png"
+
+    upload = Mock(side_effect=lambda data, mime, filename, kind, *, client:
+                  _material_receipt(data, kind, client.account["id"]))
+    monkeypatch.setattr("app.client._download", download)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    first = clients[0].upload_inputs(_material_request(images=["source"]))
+    second = clients[1].upload_inputs(_material_request(**{other_kind: ["source"]}))
+    assert upload.call_count == 2
+    assert first["images"][0]["url"] != second[other_kind][0]["url"]
+    assert proxies == [api.account["proxy_url"] for api in clients]
+
+
+def test_global_material_slots_bound_downloaded_payloads_and_uploads(monkeypatch, tmp_path, material_slots):
+    store = Store(str(tmp_path / "cache.db"))
+    ready = threading.Barrier(8)
+    four_downloads, two_uploads = threading.Event(), threading.Event()
+    release_downloads, release_uploads = threading.Event(), threading.Event()
+    guard = threading.Lock()
+    counts = {"prepared": 0, "uploading": 0, "max_prepared": 0, "max_uploading": 0, "downloads": 0}
+
+    def download(source, kind, proxy):
+        with guard:
+            counts["prepared"] += 1
+            counts["downloads"] += 1
+            counts["max_prepared"] = max(counts["max_prepared"], counts["prepared"])
+            if counts["downloads"] == 4:
+                four_downloads.set()
+        assert release_downloads.wait(timeout=5)
+        return source.encode(), "image/png", "r.png"
+
+    def upload(data, mime, filename, kind, *, client):
+        with guard:
+            counts["uploading"] += 1
+            counts["max_uploading"] = max(counts["max_uploading"], counts["uploading"])
+            if counts["uploading"] == 2:
+                two_uploads.set()
+        try:
+            assert release_uploads.wait(timeout=5)
+            return _material_receipt(data, kind)
+        finally:
+            with guard:
+                counts["uploading"] -= 1
+                counts["prepared"] -= 1
+
+    def prepare(index):
+        api = _material_client(store)
+        ready.wait(timeout=5)
+        return api.upload_inputs(_material_request(images=[str(index)]))
+
+    monkeypatch.setattr("app.client._download", download)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(prepare, index) for index in range(8)]
+        try:
+            assert four_downloads.wait(timeout=5)
+            with guard:
+                assert counts["downloads"] == 4
+            release_downloads.set()
+            assert two_uploads.wait(timeout=5)
+            with guard:
+                # Two uploads and two waiting uploads still hold all preparation slots.
+                assert counts["downloads"] == 4
+        finally:
+            release_downloads.set()
+            release_uploads.set()
+        assert all(future.result(timeout=8)["images"] for future in futures)
+    assert counts["max_prepared"] == 4 and counts["max_uploading"] == 2
+    assert counts["prepared"] == counts["uploading"] == 0
+
+
+@pytest.mark.parametrize("phase", ["download", "upload", "cache"])
+def test_material_failures_release_slots_and_digest_lock_without_retry(monkeypatch, tmp_path, material_slots, phase):
+    store = Store(str(tmp_path / "cache.db"))
+    api = _material_client(store)
+    download = Mock(return_value=(b"retryable material", "image/png", "r.png"))
+    upload = Mock(return_value=_material_receipt(b"retryable material", "images"))
+    monkeypatch.setattr("app.client._download", download)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    original_put = store.media_cache_put
+    if phase == "download":
+        download.side_effect = RuntimeError("download failed")
+    elif phase == "upload":
+        upload.side_effect = RuntimeError("upload failed")
+    else:
+        monkeypatch.setattr(store, "media_cache_put", Mock(side_effect=RuntimeError("cache failed")))
+    with pytest.raises(RuntimeError, match=f"{phase} failed"):
+        api.upload_inputs(_material_request(images=["source"]))
+    assert upload.call_count == (0 if phase == "download" else 1)
+    digest = hashlib.sha256(b"retryable material").hexdigest()
+    assert store.media_cache_get(1, "images", digest) is None
+    for semaphore, limit in zip(material_slots, (4, 2)):
+        _assert_slots_available(semaphore, limit)
+    download.side_effect = upload.side_effect = None
+    monkeypatch.setattr(store, "media_cache_put", original_put)
+    assert api.upload_inputs(_material_request(images=["source"]))["images"]
+
+
+@pytest.mark.parametrize("receipt", [{}, {"url": ""}, {"url": "http://incomplete.example.test/a"}])
+def test_incomplete_upload_receipt_is_never_cached(monkeypatch, tmp_path, material_slots, receipt):
+    store = Store(str(tmp_path / "cache.db"))
+    api = _material_client(store)
+    monkeypatch.setattr("app.client._download", lambda *args: (b"image", "image/png", "r.png"))
+    upload = Mock(return_value=receipt)
+    monkeypatch.setattr("app.client.upload_media_bytes", upload)
+    with pytest.raises(NadError, match="no complete material receipt"):
+        api.upload_inputs(_material_request(images=["source"]))
+    assert upload.call_count == 1
+    assert store.media_cache_get(1, "images", hashlib.sha256(b"image").hexdigest()) is None
+
+
+def test_material_order_and_compliance_are_outside_upload_slots(monkeypatch, tmp_path, material_slots):
+    api = _material_client(Store(str(tmp_path / "cache.db")))
+    normalized = _material_request(images=["image2", "image1"], videos=["video1"], audios=["audio1"], family="2.0")
+    monkeypatch.setattr("app.client._download", lambda source, *args: (source.encode(), "image/png", "r.png"))
+    monkeypatch.setattr("app.client.upload_media_bytes", lambda data, mime, filename, kind, **kwargs:
+                        _material_receipt(data, kind))
+    expected = [_material_receipt(source.encode(), kind)["url"] for kind in ("images", "videos", "audios")
+                for source in normalized[kind]]
+
+    def compliance(method, path, urls):
+        assert method == "POST" and path == "/apis/nadouai/doubao/upload_asset" and urls == expected
+        for semaphore, limit in zip(material_slots, (4, 2)):
+            _assert_slots_available(semaphore, limit)
+        return {"data": [{"metadata": {"doubaoAssetStatus": "Active"}} for _ in urls]}
+
+    api.request = Mock(side_effect=compliance)
+    result = api.upload_inputs(normalized)
+    assert [item["url"] for kind in result for item in result[kind]] == expected
     assert api.request.call_count == 1

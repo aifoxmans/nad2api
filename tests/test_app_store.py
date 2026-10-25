@@ -106,3 +106,31 @@ def test_public_messages_use_only_fixed_vocabulary(code, raw):
     assert raw not in error["message"]
     assert error["category"]
     assert "?" not in error["message"]
+
+
+@pytest.mark.parametrize("raw", [
+    "生成的视频涉及版权限制，请修改后重试。",
+    "Artifact rejected by copyright policy: private upstream diagnostic",
+])
+def test_copyright_failure_uses_existing_content_policy_message(raw):
+    error = public_error("UPSTREAM_FAILED", raw)
+    assert error["category"] == "content_policy"
+    assert error["message"] == "检测到内容有敏感或违规情况，请修改后重试，积分已返还～"
+    assert raw not in error["message"]
+
+
+def test_pre_submit_source_timeout_is_a_download_error():
+    error = public_error("MEDIAERROR", "reference download failed: ReadTimeout")
+    assert error["category"] == "invalid_request"
+    assert error["message"] == "素材下载失败，请检查素材链接后重试~"
+
+
+def test_unconfirmed_submission_stays_unknown_despite_policy_words():
+    error = public_error("UPSTREAM_SUBMIT_OUTCOME_UNKNOWN", "copyright check response unavailable")
+    assert error["category"] == "submission_unknown"
+
+
+def test_operator_queue_cancellation_does_not_claim_generation_or_refund():
+    error = public_error("QUEUE_CANCELLED", "operator cancelled before upstream submission; no generation request sent")
+    assert error["message"] == "队列排队服务中断，请稍后再试~"
+    assert "积分" not in error["message"]

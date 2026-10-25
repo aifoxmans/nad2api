@@ -69,6 +69,10 @@ The reward operation claims only rewards that the upstream explicitly marks as r
 
 Public errors use a bounded normalization vocabulary. Administrators can inspect both the normalized response and the upstream diagnostic in task details. Clear-completed removes terminal task records and their associated local data while preserving accounts and unresolved tasks.
 
+If an output reports only a generic artifact failure, the gateway checks that same task's bounded message history for a matching output's explicit failure reason. Upstream copyright restrictions use the existing content-policy response; source download timeouts use the material-download response.
+
+Tasks prepare their materials concurrently within the configured worker and account limits. A global limit of four material preparations and two uploads bounds network and memory use. Uploads of identical bytes share one receipt only within the same account and material type. Generation submission is never retried by these upload controls.
+
 ## GitHub Actions and preproduction
 
 `.github/workflows/deploy-test.yml` validates the application and builds/pushes its image on GitHub-hosted runners. The `nad2api-pre` self-hosted runner only pulls the published image, restarts this service, and configures the Cloudflared route. It does not build an image on the deployment host.

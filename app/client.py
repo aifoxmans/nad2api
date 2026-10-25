@@ -21,11 +21,28 @@ from .store import Store
 GRAPH = "/apis/graph/screenplay2drama/nadou_agent/graph"
 _MEDIA_LOCKS_GUARD = threading.RLock()
 _MEDIA_LOCKS: dict[int, threading.RLock] = {}
+_MEDIA_CACHE_LOCKS_GUARD = threading.Lock()
+_MEDIA_CACHE_LOCKS: dict[tuple[int, str, str], threading.RLock] = {}
+# Bound downloaded payloads separately from the actual upstream upload calls.
+# These slots are shared by all task clients; each client keeps its own session.
+_MATERIAL_PREPARATION_SLOTS = threading.BoundedSemaphore(4)
+_MATERIAL_UPLOAD_SLOTS = threading.BoundedSemaphore(2)
 
 
 def account_media_lock(account_id: int) -> threading.RLock:
     with _MEDIA_LOCKS_GUARD:
         return _MEDIA_LOCKS.setdefault(account_id, threading.RLock())
+
+
+def _media_cache_lock(account_id: int, kind: str, digest: str) -> threading.RLock:
+    with _MEDIA_CACHE_LOCKS_GUARD:
+        return _MEDIA_CACHE_LOCKS.setdefault((account_id, kind, digest), threading.RLock())
+
+
+def _complete_media_receipt(receipt: Any) -> bool:
+    # upload_media_bytes returns only after all chunks and metadata are confirmed.
+    # Incomplete responses must never be reused by another task.
+    return isinstance(receipt, dict) and isinstance(receipt.get("url"), str) and receipt["url"].startswith("https://")
 
 
 class NadError(BrowserError):
@@ -73,6 +90,51 @@ def extract_result_urls(value: dict[str, Any]) -> list[str]:
             if isinstance(url, str) and url.startswith("https://") and url not in urls:
                 urls.append(url)
     return urls
+
+
+def extract_artifact_failure(history: dict[str, Any], thread_id: str, asset_path: str) -> str:
+    """Read only a completed server notification for this exact video artifact."""
+    data = history.get("data")
+    turns = data.get("turns") if isinstance(data, dict) else None
+    if not isinstance(turns, list) or not asset_path.startswith("/videos/"):
+        return ""
+    for turn in reversed(turns[-5:]):
+        messages = turn.get("messages") if isinstance(turn, dict) else None
+        if not isinstance(messages, list):
+            continue
+        for message in reversed(messages[-256:]):
+            if not isinstance(message, dict) or message.get("thread_id") != thread_id:
+                continue
+            update = message.get("data")
+            if (not isinstance(update, dict) or update.get("stream_mode") != "updates"
+                    or update.get("status") != "completed"):
+                continue
+            role = update.get("metadata")
+            if not isinstance(role, dict) or role.get("agent_role") != "main_director":
+                continue
+            content = update.get("content")
+            asset = content.get("_single_asset") if isinstance(content, dict) else None
+            if not isinstance(asset, dict) or asset.get("status") not in {"error", "failed"}:
+                continue
+            parts = asset.get("notify_parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts[:32]:
+                if not isinstance(part, dict):
+                    continue
+                metadata, filename = part.get("metadata"), part.get("filename")
+                if not isinstance(metadata, dict) or metadata.get("state") != "ERROR" or not isinstance(filename, str):
+                    continue
+                location = metadata.get("location")
+                path = filename if filename.startswith("/") else (
+                    str(location).rstrip("/") + "/" + filename if isinstance(location, str) else "")
+                error = metadata.get("error")
+                if path != asset_path or not isinstance(error, str):
+                    continue
+                error = error.strip()
+                if error and error.casefold() != "artifact generation failed":
+                    return error[:500]
+    return ""
 
 
 class NadClient:
@@ -165,20 +227,36 @@ class NadClient:
 
     checkin = daily_checkin
 
+    def _upload_input(self, source: str, kind: str, account_id: int) -> dict[str, Any]:
+        with _MATERIAL_PREPARATION_SLOTS:
+            data = None
+            try:
+                data, mime, filename = _download(source, kind, str(self.account["proxy_url"]))
+                digest = hashlib.sha256(data).hexdigest()
+                # Only identical material for the same account shares a flight.
+                # A different material must not wait behind this account's upload.
+                with _media_cache_lock(account_id, kind, digest):
+                    receipt = self.store.media_cache_get(account_id, kind, digest) if self.store else None
+                    if not _complete_media_receipt(receipt):
+                        with _MATERIAL_UPLOAD_SLOTS:
+                            receipt = upload_media_bytes(data, mime, filename, kind, client=self)
+                        if not _complete_media_receipt(receipt):
+                            raise NadError("Nadou upload returned no complete material receipt")
+                        if self.store:
+                            self.store.media_cache_put(account_id, kind, digest, receipt)
+                    return dict(receipt)
+            finally:
+                # Release the payload before another worker gets a preparation slot.
+                data = None
+
     def upload_inputs(self, normalized: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         result: dict[str, list[dict[str, Any]]] = {"images": [], "videos": [], "audios": []}
         account_id = int(self.account["id"])
         for kind in result:
             for source in normalized[kind]:
-                data, mime, filename = _download(source, kind, str(self.account["proxy_url"]))
-                digest = hashlib.sha256(data).hexdigest()
-                with account_media_lock(account_id):
-                    receipt = self.store.media_cache_get(account_id, kind, digest) if self.store else None
-                    if not receipt:
-                        receipt = upload_media_bytes(data, mime, filename, kind, client=self)
-                        if self.store:
-                            self.store.media_cache_put(account_id, kind, digest, receipt)
-                    result[kind].append(dict(receipt))
+                # Each task retains the caller's order without sharing its session
+                # across threads; independent tasks prepare concurrently.
+                result[kind].append(self._upload_input(source, kind, account_id))
         validate_material_durations(normalized, result)
         # Seedance web clients register all materials for compliance before
         # generation, preserving the normal upstream validation mechanism.
@@ -239,6 +317,17 @@ class NadClient:
         status = str(upstream.get("status") or "RUNNING").upper()
         error = str((failed or {}).get("error") or (failed or {}).get("msg") or upstream.get("msg") or "")[:500]
         terminal_failure = failed is not None or status in {"FAILED", "ERROR", "CANCELED", "CANCELLED", "INTERRUPTED"}
+        if failed is not None and error.strip().casefold() == "artifact generation failed":
+            path = failed.get("path")
+            if isinstance(path, str) and path.startswith("/videos/"):
+                try:
+                    history = self.request("GET", GRAPH + "/message_history",
+                                           params={"thread_id": thread_id, "limit": 5}, timeout=(5, 10))
+                    error = extract_artifact_failure(history, thread_id, path) or error
+                except Exception:
+                    # A failed diagnostic query cannot turn an established video
+                    # failure into an uncertain submission or repeat generation.
+                    pass
         return {"status": "failed" if terminal_failure else "running", "state": status,
                 "result_urls": [], "error_code": "UPSTREAM_FAILED" if terminal_failure else "", "error": error,
                 "credits_consumed": None, "cost_evidence": {"source": "unknown"}}

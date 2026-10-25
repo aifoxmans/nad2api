@@ -1,4 +1,6 @@
 import importlib
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import time
 
 import pytest
@@ -75,6 +77,83 @@ def test_cookie_only_account_executes_one_task_without_browser(service):
     assert Client.submissions == 1
     assert service.create({"model": "sd-2-0-mini", "prompt": "lake", "resolution": "480p"}, idempotency_key="one")["id"] == task["id"]
     assert len(service._pool.calls) == 1
+
+
+def test_same_account_tasks_prepare_concurrently_with_distinct_generation_ids(service, monkeypatch):
+    service.store.update_account(1, {"max_concurrency": 2})
+    barrier = threading.Barrier(2)
+    submissions = []
+    guard = threading.Lock()
+
+    class ConcurrentClient(Client):
+        def upload_inputs(self, normalized):
+            self.label = normalized["prompt"]
+            task = next(task for task in service.store.tasks() if task["prompt"] == self.label)
+            assert task["status"] == "preparing" and task["account_id"] == 1
+            # The previous account-wide lock prevented a second task from
+            # reaching this point until the first finished all preparation.
+            barrier.wait(timeout=3)
+            return {"images": [], "videos": [], "audios": []}
+
+        def submit(self, normalized, assets):
+            with guard:
+                submissions.append(self.label)
+            return {"run_id": "run-" + self.label, "thread_id": "thread-" + self.label}
+
+        def poll(self, run_id, thread_id):
+            assert (run_id, thread_id) == ("run-" + self.label, "thread-" + self.label)
+            return {"status": "succeeded", "result_urls": ["https://cdn.test/" + self.label + ".mp4"]}
+
+    monkeypatch.setattr("app.service.NadClient", ConcurrentClient)
+    tasks = [service.create({"model": "sd-2-0-mini", "prompt": label}) for label in ("one", "two")]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(service._run, task["id"]) for task in tasks]
+        for future in futures:
+            future.result(timeout=5)
+    assert sorted(submissions) == ["one", "two"]
+    stored = [service.store.task(task["id"]) for task in tasks]
+    assert all(task["status"] == "succeeded" for task in stored)
+    assert {task["run_id"] for task in stored} == {"run-one", "run-two"}
+    assert {task["thread_id"] for task in stored} == {"thread-one", "thread-two"}
+    assert service._active[1] == 0
+
+
+@pytest.mark.parametrize("ambiguous", [False, True])
+def test_duplicate_dispatch_while_still_queued_never_submits_twice(service, monkeypatch, ambiguous):
+    service.store.update_account(1, {"max_concurrency": 2})
+    reserved, release = threading.Event(), threading.Event()
+    reserve = service._reserve_account
+
+    def paused_reserve(*args, **kwargs):
+        account = reserve(*args, **kwargs)
+        if account:
+            reserved.set()
+            assert release.wait(timeout=3)
+        return account
+
+    monkeypatch.setattr(service, "_reserve_account", paused_reserve)
+    Client.error = BrowserError("connection closed after generation POST") if ambiguous else None
+    task = service.create({"model": "sd-2-0-mini", "prompt": "lake"})
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(service._run, task["id"])
+        try:
+            assert reserved.wait(timeout=2)
+            assert service.store.task(task["id"])["status"] == "queued"
+            duplicate = pool.submit(service._run, task["id"])
+            duplicate.result(timeout=1)
+        finally:
+            release.set()
+        first.result(timeout=4)
+    stored = service.store.task(task["id"])
+    assert Client.submissions == 1
+    assert stored["status"] == ("submission_unknown" if ambiguous else "succeeded")
+    if ambiguous:
+        assert not stored["run_id"]
+        service._run(task["id"])
+        assert Client.submissions == 1
+    else:
+        assert (stored["run_id"], stored["thread_id"]) == ("upstream-task", "account-thread")
+    assert service._active[1] == 0
 
 
 def test_ambiguous_generation_is_never_replayed_or_counted_as_executing(service):

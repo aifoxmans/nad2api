@@ -94,6 +94,7 @@ class Service:
         self._pool = ThreadPoolExecutor(max_workers=50, thread_name_prefix="nad-task")
         self._lock = threading.RLock()
         self._active: dict[int, int] = {}
+        self._claimed_tasks: set[str] = set()
         self._worker_slots = threading.BoundedSemaphore(50)
         self._started = False
         self._stop = threading.Event()
@@ -330,6 +331,20 @@ class Service:
         return self.store.update_account(account_id, values)
 
     def _run(self, task_id: str) -> None:
+        # Multiple dispatcher/recovery calls must never turn one queued task
+        # into concurrent generation requests, even while preparation overlaps.
+        with self._lock:
+            task = self.store.task(task_id)
+            if not task or task["status"] != "queued" or task_id in self._claimed_tasks:
+                return
+            self._claimed_tasks.add(task_id)
+        try:
+            self._run_claimed(task_id)
+        finally:
+            with self._lock:
+                self._claimed_tasks.discard(task_id)
+
+    def _run_claimed(self, task_id: str) -> None:
         task = self.store.task(task_id)
         if not task or task["status"] != "queued":
             return
@@ -388,52 +403,54 @@ class Service:
                 owned = False
                 client = None
                 try:
+                    if self._stop.is_set():
+                        return
+                    self.store.update_task(task_id, {"account_id": account_id,
+                        "status": "preparing", "progress": 5, "balance_before": None,
+                        "run_id": "", "thread_id": "", "error_code": "", "error_message": "",
+                        "upstream_request": {}})
+                    # Only profile/auth acquisition is account-serialized. Each
+                    # task then uses its own client/session for preparation and submit.
                     with account_media_lock(account_id):
-                        if self._stop.is_set():
-                            return
-                        self.store.update_task(task_id, {"account_id": account_id,
-                            "status": "preparing", "progress": 5, "balance_before": None,
-                            "run_id": "", "thread_id": "", "error_code": "", "error_message": "",
-                            "upstream_request": {}})
                         account, owned = self.browser_runtime.acquire(account)
                         client = NadClient(account, store=self.store)
-                        # A just-started Chrome can expose CDP before the app is ready.
-                        for attempt in range(12):
-                            try:
-                                before = client.account_state()["available_balance"]
-                                break
-                            except BrowserError as exc:
-                                if "JavaScript request failed" not in str(exc) or attempt == 11:
-                                    raise
-                                if self._stop.wait(2):
-                                    return
-                        self.store.update_account(account_id, {"balance": before, "status": "active"})
-                        self.store.update_task(task_id, {"balance_before": before, "progress": 12})
-                        assets = client.upload_inputs(task["normalized"])
-                        self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
-                        self.store.update_task(task_id, {"progress": 30})
-                        attempted.append(account_id)
-                        self.store.update_task(task_id, {"attempted_account_ids": attempted})
+                    # A just-started Chrome can expose CDP before the app is ready.
+                    for attempt in range(12):
                         try:
-                            submitted = client.submit(task["normalized"], assets)
-                        except BrowserRejected as exc:
-                            if not _credit_rejected(str(exc)):
-                                self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
-                                return
-                            raise AccountCreditRejected(str(exc)) from exc
+                            before = client.account_state()["available_balance"]
+                            break
                         except BrowserError as exc:
-                            self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
-                                       str(exc) + "; automatic resubmission is disabled")
+                            if "JavaScript request failed" not in str(exc) or attempt == 11:
+                                raise
+                            if self._stop.wait(2):
+                                return
+                    self.store.update_account(account_id, {"balance": before, "status": "active"})
+                    self.store.update_task(task_id, {"balance_before": before, "progress": 12})
+                    assets = client.upload_inputs(task["normalized"])
+                    self.store.update_task(task_id, {"cost_evidence": input_evidence(assets)})
+                    self.store.update_task(task_id, {"progress": 30})
+                    attempted.append(account_id)
+                    self.store.update_task(task_id, {"attempted_account_ids": attempted})
+                    try:
+                        submitted = client.submit(task["normalized"], assets)
+                    except BrowserRejected as exc:
+                        if not _credit_rejected(str(exc)):
+                            self._fail(task_id, "UPSTREAM_REJECTED", str(exc))
                             return
-                        finally:
-                            audit = getattr(client, "last_submit_request", None)
-                            if isinstance(audit, dict) and audit:
-                                self.store.update_task(task_id, {"upstream_request": audit,
-                                    "thread_id": str((audit.get("query") or {}).get("thread_id") or "")})
-                        self.store.update_task(task_id, {**cost_values(submitted), "status": "submitted", "progress": 40,
-                                                      "upstream_request": submitted.get("upstream_request") or {},
-                                                      "run_id": submitted["run_id"],
-                                                      "thread_id": submitted["thread_id"]})
+                        raise AccountCreditRejected(str(exc)) from exc
+                    except BrowserError as exc:
+                        self._fail(task_id, "UPSTREAM_SUBMIT_OUTCOME_UNKNOWN",
+                                   str(exc) + "; automatic resubmission is disabled")
+                        return
+                    finally:
+                        audit = getattr(client, "last_submit_request", None)
+                        if isinstance(audit, dict) and audit:
+                            self.store.update_task(task_id, {"upstream_request": audit,
+                                "thread_id": str((audit.get("query") or {}).get("thread_id") or "")})
+                    self.store.update_task(task_id, {**cost_values(submitted), "status": "submitted", "progress": 40,
+                                                  "upstream_request": submitted.get("upstream_request") or {},
+                                                  "run_id": submitted["run_id"],
+                                                  "thread_id": submitted["thread_id"]})
                     self._poll(task_id, client,
                                time.monotonic() + int(self.settings()["task_timeout_seconds"]))
                     return
