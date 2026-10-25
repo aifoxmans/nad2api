@@ -85,6 +85,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "allow_video_reference_inputs": True,
     "excess_media_policy": "reject",
     "prompt_media_reference_cleanup_enabled": True,
+    "strict_prompt_media_references": False,
 }
 
 
@@ -109,6 +110,9 @@ class Service:
     def update_settings(self, values: dict[str, Any]) -> dict[str, Any]:
         allowed = set(DEFAULT_SETTINGS)
         filtered = {key: value for key, value in values.items() if key in allowed}
+        if ("strict_prompt_media_references" in filtered
+                and not isinstance(filtered["strict_prompt_media_references"], bool)):
+            raise ValueError("strict_prompt_media_references must be a boolean")
         limits = {"task_workers": (1, 50), "task_queue_capacity": (0, 10000),
                   "poll_interval_seconds": (2, 120), "task_timeout_seconds": (60, 7200),
                   "account_maintenance_interval_seconds": (30, 86400)}
@@ -232,12 +236,13 @@ class Service:
                 "received": result.get("receive_quota", 0)}
 
     def create(self, request: dict[str, Any], *, idempotency_key: str = "") -> dict[str, Any]:
-        normalized = normalize_request(request)
         if idempotency_key:
             existing = self.store.idempotent_task(idempotency_key, request)
             if existing:
                 return self.public_task(existing)
         settings = self.settings()
+        normalized = normalize_request(
+            request, strict_prompt_media_references=settings["strict_prompt_media_references"])
         if not bool(settings["allow_video_reference_inputs"]) and normalized["videos"]:
             raise ValueError("video reference inputs are disabled by service settings")
         estimated_cost = _estimate_cost(normalized, self.store.model_costs())

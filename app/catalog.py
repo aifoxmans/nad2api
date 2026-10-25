@@ -164,7 +164,8 @@ def media_alias_kind(label: str) -> str:
     return "audios"
 
 
-def prompt_references(prompt: str, media: dict[str, list[Any]]) -> list[tuple[str, int]]:
+def prompt_references(prompt: str, media: dict[str, list[Any]], *,
+                      strict_prompt_media_references: bool = False) -> list[tuple[str, int]]:
     found = []
     for is_url, segment in _plain_segments(prompt):
         if is_url:
@@ -174,13 +175,18 @@ def prompt_references(prompt: str, media: dict[str, list[Any]]) -> list[tuple[st
             if not media[kind] and not match.group("explicit"):
                 continue
             if not 1 <= index <= len(media[kind]):
-                raise ValueError(f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
+                if strict_prompt_media_references:
+                    raise ValueError(f"prompt references {match.group(0)} but only {len(media[kind])} {kind} were provided")
+                continue
             found.append((kind, index))
     return found
 
 
-def bind_prompt(prompt: str, assets: dict[str, list[Any]], sources: dict[str, Any] | None = None) -> str:
+def bind_prompt(prompt: str, assets: dict[str, list[Any]], sources: dict[str, Any] | None = None, *,
+                strict_prompt_media_references: bool = False) -> str:
     """Build the same escaped reference-tag HTML that the web composer submits."""
+    provided = sources if sources is not None else assets
+
     def reference(kind, index):
         if not 1 <= index <= len(assets[kind]):
             raise ValueError("unbound media reference")
@@ -210,9 +216,13 @@ def bind_prompt(prompt: str, assets: dict[str, list[Any]], sources: dict[str, An
         for match in ALIASES.finditer(segment):
             chunks.append(html.escape(segment[end:match.start()]).replace("\n", "<br>"))
             kind, index = media_alias_kind(match.group("kind")), int(match.group("index"))
-            if not assets[kind] and not match.group("explicit"):
+            count = len(provided.get(kind) or [])
+            if ((not count and not match.group("explicit"))
+                    or (not strict_prompt_media_references and not 1 <= index <= count)):
                 chunks.append(html.escape(match.group(0)))
             else:
+                if not 1 <= index <= count:
+                    raise ValueError("unbound media reference")
                 chunks.append(reference(kind, index))
             end = match.end()
         chunks.append(html.escape(segment[end:]).replace("\n", "<br>"))
@@ -240,7 +250,7 @@ def _media_list(body: dict[str, Any], names: tuple[str, ...]) -> list[str]:
     return [_url(item) for item in (value if isinstance(value, list) else [value])]
 
 
-def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
+def normalize_request(body: dict[str, Any], *, strict_prompt_media_references: bool = False) -> dict[str, Any]:
     name = str(body.get("model") or "sd-2-0-mini").strip()
     spec = MODELS.get(name)
     if spec is None:
@@ -292,7 +302,7 @@ def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("minimax-h3 supports at most 12 total reference materials")
     if str(body.get("n", body.get("generate_count", 1))) != "1":
         raise ValueError("only one video per task is supported")
-    prompt_references(prompt, media)
+    prompt_references(prompt, media, strict_prompt_media_references=strict_prompt_media_references)
     has_media = any(media.values())
     if spec.family == "vidu" and not has_media:
         raise ValueError("the observed Vidu Q4 interface requires reference materials")
@@ -318,7 +328,8 @@ def normalize_request(body: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"{name} does not expose an audio-disable parameter in the observed Nadou interface")
     return {"model": name, "upstream_model": spec.upstream_model, "family": spec.family,
             "duration": duration, "resolution": resolution, "aspect_ratio": ratio,
-            "prompt": prompt, "mode": mode, "generate_audio": generate_audio, **media}
+            "prompt": prompt, "mode": mode, "generate_audio": generate_audio,
+            "strict_prompt_media_references": strict_prompt_media_references, **media}
 
 
 def public_models() -> list[dict[str, Any]]:

@@ -66,6 +66,145 @@ def service(tmp_path, monkeypatch):
     value.stop()
 
 
+def test_prompt_reference_validation_defaults_to_permissive_snapshot(service):
+    assert service.settings()["strict_prompt_media_references"] is False
+    request = {"model": "sd-2-0-mini", "prompt": "Use image2 in the next scene",
+               "image_urls": ["https://example.test/image.png"]}
+    task = service.create(request)
+    stored = service.store.task(task["id"])
+    assert stored["status"] == "queued"
+    assert stored["normalized"]["strict_prompt_media_references"] is False
+    assert stored["normalized"]["prompt"] == request["prompt"]
+    assert stored["request"] == request
+    assert len(service._pool.calls) == 1
+    assert Client.submissions == 0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_strict_prompt_reference_setting_persists_after_service_restart(service, enabled):
+    result = service.update_settings({"strict_prompt_media_references": enabled})
+    assert result["strict_prompt_media_references"] is enabled
+    assert service.store.get_settings()["strict_prompt_media_references"] is enabled
+    restarted = Service(Store(str(service.store.path)))
+    restarted._pool = Queue()
+    try:
+        assert restarted.settings()["strict_prompt_media_references"] is enabled
+    finally:
+        restarted.stop()
+
+
+@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, None, [], {}])
+def test_strict_prompt_reference_setting_requires_json_boolean(service, invalid):
+    with pytest.raises(ValueError, match="strict_prompt_media_references must be a boolean"):
+        service.update_settings({"strict_prompt_media_references": invalid})
+    assert service.settings()["strict_prompt_media_references"] is False
+    assert "strict_prompt_media_references" not in service.store.get_settings()
+
+
+def test_strict_reference_rejection_never_persists_or_queues_task(service):
+    service.update_settings({"strict_prompt_media_references": True})
+    request = {"model": "sd-2-0-mini", "prompt": "Use image2 in the next scene",
+               "image_urls": ["https://example.test/image.png"]}
+    with pytest.raises(ValueError):
+        service.create(request, idempotency_key="strict-rejected")
+    assert service.store.tasks() == []
+    assert service._pool.calls == []
+    assert service.store.idempotent_task("strict-rejected", request) is None
+    assert Client.submissions == 0
+
+
+def test_accepted_idempotency_precedes_changed_reference_settings(service, monkeypatch):
+    request = {"model": "sd-2-0-mini", "prompt": "Use image2 in the next scene",
+               "image_urls": ["https://example.test/image.png"]}
+    task = service.create(request, idempotency_key="accepted-permissive")
+    service.update_settings({"strict_prompt_media_references": True})
+    # Recovery must not re-read settings or re-normalize an accepted request.
+    def settings_must_not_be_read():
+        raise AssertionError("accepted idempotency lookup must precede settings")
+
+    monkeypatch.setattr(service, "settings", settings_must_not_be_read)
+    again = service.create(request, idempotency_key="accepted-permissive")
+    assert again["id"] == task["id"]
+    assert len(service.store.tasks()) == len(service._pool.calls) == 1
+    assert service.store.task(task["id"])["normalized"]["strict_prompt_media_references"] is False
+
+
+def test_queued_tasks_keep_reference_validation_snapshot_after_settings_change(service, monkeypatch):
+    observed = []
+
+    class SnapshotClient(Client):
+        def upload_inputs(self, normalized):
+            observed.append((normalized["prompt"], normalized["strict_prompt_media_references"]))
+            return super().upload_inputs(normalized)
+
+    monkeypatch.setattr("app.service.NadClient", SnapshotClient)
+    first = service.create({"model": "sd-2-0-mini", "prompt": "Use image2",
+                            "image_urls": ["https://example.test/image.png"]})
+    service.update_settings({"strict_prompt_media_references": True})
+    second = service.create({"model": "sd-2-0-mini", "prompt": "Use image1",
+                             "image_urls": ["https://example.test/image.png"]})
+    # The permissive task runs after strict validation was enabled.
+    service._run(first["id"])
+    service.update_settings({"strict_prompt_media_references": False})
+    # The strict task runs after the setting was disabled.
+    service._run(second["id"])
+    assert observed == [("Use image2", False), ("Use image1", True)]
+    for task, expected in ((first, False), (second, True)):
+        stored = service.store.task(task["id"])
+        assert stored["status"] == "succeeded"
+        assert stored["normalized"]["strict_prompt_media_references"] is expected
+
+
+def test_settings_api_boolean_validation_and_reference_rejection_are_isolated(service, monkeypatch):
+    monkeypatch.setenv("NAD_API_KEY", "test-api")
+    monkeypatch.setenv("NAD_ADMIN_TOKEN", "test-admin")
+    monkeypatch.setenv("NAD_DATA_DIR", str(service.store.path.parent / "unused-main"))
+    main = importlib.import_module("app.main")
+    monkeypatch.setattr(main, "store", service.store)
+    monkeypatch.setattr(main, "service", service)
+    monkeypatch.setattr(main, "API_KEY", "settings-api")
+    monkeypatch.setattr(main, "ADMIN_TOKEN", "settings-admin")
+    # Without a context manager, TestClient never enters the real lifespan or
+    # starts account maintenance/workers. The fixture's Queue records dispatch.
+    api = TestClient(main.app)
+    admin = {"X-Admin-Token": "settings-admin"}
+    caller = {"Authorization": "Bearer settings-api", "Idempotency-Key": "permissive-api-case"}
+    assert api.get("/api/settings").status_code == 401
+    assert api.get("/api/settings", headers=admin).json()["strict_prompt_media_references"] is False
+    for headers in ({}, caller):
+        unauthorized = api.patch("/api/settings", headers=headers,
+                                 json={"strict_prompt_media_references": True})
+        assert unauthorized.status_code == 401
+        assert service.settings()["strict_prompt_media_references"] is False
+    strict = api.patch("/api/settings", headers=admin,
+                       json={"strict_prompt_media_references": True})
+    assert strict.status_code == 200
+    assert strict.json()["strict_prompt_media_references"] is True
+    invalid = api.patch("/api/settings", headers=admin,
+                        json={"strict_prompt_media_references": "false"})
+    assert invalid.status_code == 422
+    assert api.get("/api/settings", headers=admin).json()["strict_prompt_media_references"] is True
+    request = {"model": "sd-2-0-mini", "prompt": "Use image2",
+               "image_urls": ["https://example.test/image.png"]}
+    rejected = api.post("/v1/videos", headers=caller, json=request)
+    assert rejected.status_code == 422
+    assert rejected.headers["X-NADAPI-Submit-Outcome"] == "not-accepted"
+    assert service.store.tasks() == [] and service._pool.calls == []
+    permissive = api.patch("/api/settings", headers=admin,
+                           json={"strict_prompt_media_references": False})
+    assert permissive.status_code == 200
+    assert permissive.json()["strict_prompt_media_references"] is False
+    accepted = api.post("/v1/videos", headers=caller, json=request)
+    assert accepted.status_code == 200
+    assert service.store.task(accepted.json()["id"])["normalized"]["strict_prompt_media_references"] is False
+    assert api.patch("/api/settings", headers=admin,
+                     json={"strict_prompt_media_references": True}).status_code == 200
+    replay = api.post("/v1/videos", headers=caller, json=request)
+    assert replay.status_code == 200 and replay.json()["id"] == accepted.json()["id"]
+    assert len(service.store.tasks()) == len(service._pool.calls) == 1
+    assert Client.submissions == 0
+
+
 def test_cookie_only_account_executes_one_task_without_browser(service):
     task = service.create({"model": "sd-2-0-mini", "prompt": "lake", "resolution": "480p"}, idempotency_key="one")
     service._run(task["id"])

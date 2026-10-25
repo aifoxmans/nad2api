@@ -11,6 +11,7 @@ from app.browser import BrowserRejected
 from app.catalog import normalize_request
 from app.client import GRAPH, NadClient, NadError, build_submit_body, build_video_param, extract_result_urls
 from app.media import CHUNK_THRESHOLD, upload_media_bytes, validate_material_durations
+from app.store import Store
 
 
 def test_material_failure_identifies_type_and_index_without_source_url(monkeypatch):
@@ -27,7 +28,6 @@ def test_material_failure_identifies_type_and_index_without_source_url(monkeypat
     with pytest.raises(MediaError, match=r"images\[2\]: reference download failed") as raised:
         api.upload_inputs(n)
     assert "token=" not in str(raised.value) and "https://" not in str(raised.value)
-from app.store import Store
 
 
 def client():
@@ -44,6 +44,24 @@ def test_submit_body_binds_all_materials_and_preserves_standard_options():
     assert body["input"]["userParams"]["taskType"] == "MULTI_REF_IMG2VIDEO"
     assert len(body["input"]["attachments"]) == 3
     assert body["input"]["content"] == param["description"]
+
+
+def test_legacy_normalized_task_without_reference_snapshot_uses_loose_binding():
+    normalized = normalize_request({"prompt": "Image1 @Image99 @Audio0", "image_urls": ["https://source.example.test/i.png"]})
+    normalized.pop("strict_prompt_media_references")
+    assets = {"images": [{"url": "https://uploaded.example.test/i.png"}], "videos": [], "audios": []}
+    param = build_video_param(normalized, assets)
+    assert param["description"].count('data-type="reference-tag"') == 1
+    assert "@Image99" in param["description"] and "@Audio0" in param["description"]
+    assert "strict_prompt_media_references" not in param
+
+
+def test_video_param_uses_the_persisted_strict_reference_snapshot():
+    normalized = normalize_request({"prompt": "Image2", "image_urls": ["https://source.example.test/1.png", "https://source.example.test/2.png"]},
+                                   strict_prompt_media_references=True)
+    assets = {"images": [{"url": "https://uploaded.example.test/1.png"}], "videos": [], "audios": []}
+    with pytest.raises(ValueError, match="unbound"):
+        build_video_param(normalized, assets)
 
 
 def test_inline_sources_are_bound_to_uploaded_assets_in_full_upstream_body():

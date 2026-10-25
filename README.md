@@ -40,7 +40,9 @@ Idempotency-Key: your-unique-request-id
 
 The response contains a `nad_...` task ID. Query `GET /v1/videos/{id}` until completion; successful outputs appear in `data[].url`. `GET /v1/videos/{id}/content` redirects to the first result. Standard Seedance `content` entries containing `text`, `image_url`, `video_url`, and `audio_url` are accepted without extra parameter wrappers.
 
-Prompt aliases such as `视频1`, `video2`, `v3`, `视4`, `图片1`, `图1`, `img2`, `Image3`, `Audio1`, and `音频2` are converted into the upstream web composer's reference tags. References remain one-based within each media type. Out-of-range references are rejected before generation. Material limits are enforced before upload, and duration checks use returned upload metadata.
+Prompt aliases such as `视频1`, `video2`, `v3`, `视4`, `图片1`, `图1`, `img2`, `Image3`, `Audio1`, and `音频2` are converted into the upstream web composer's reference tags when the corresponding material exists. References remain one-based within each media type. Out-of-range references remain ordinary text by default. Material limits are enforced before upload, and duration checks use returned upload metadata.
+
+The console's **严格校验提示词素材编号** setting (`strict_prompt_media_references`) defaults to `false`. Enable it to reject out-of-range material numbers before a new task is queued. The settings API accepts only a JSON boolean for this field. Each task keeps the setting used when accepted; later setting changes do not alter queued tasks or replay an accepted idempotency key.
 
 Direct media URLs explicitly labeled as reference images, videos, or audio in the prompt are included in the corresponding material list before model limits are checked. Repeated links reuse the same material; links already supplied in the material fields are not added again. Matching source URLs in the prompt are bound to the uploaded upstream references. Ordinary webpage links remain text. Prefer the explicit `image_urls`, `video_urls`, and `audio_urls` fields for unambiguous requests.
 

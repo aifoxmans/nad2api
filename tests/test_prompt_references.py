@@ -42,11 +42,109 @@ def test_chinese_adjacent_labels_and_html_are_safe():
 
 def test_missing_or_out_of_range_references_are_not_silently_rebound():
     with pytest.raises(ValueError, match="only 3 images"):
-        prompt_references("图4", ASSETS)
+        prompt_references("图4", ASSETS, strict_prompt_media_references=True)
     with pytest.raises(ValueError, match="unbound"):
-        bind_prompt("@audio3", ASSETS)
+        bind_prompt("@audio3", ASSETS, strict_prompt_media_references=True)
     empty = {kind: [] for kind in ASSETS}
     assert bind_prompt("视频1是一段标题", empty) == "<p>视频1是一段标题</p>"
+
+
+def test_loose_numbered_references_keep_invalid_tokens_as_safe_plain_text():
+    prompt = "@图片1|图片4|@图片9|图0|视频2|@视频5|视0|Audio1|@音频3|音0 <script>alert(1)</script>"
+    assert prompt_references(prompt, ASSETS) == [("images", 1), ("videos", 2), ("audios", 1)]
+    bound = bind_prompt(prompt, ASSETS)
+    parsed = References()
+    parsed.feed(bound)
+    assert parsed.references == [("图片1", ASSETS["images"][0]["url"]),
+                                 ("视频2", ASSETS["videos"][1]["url"]),
+                                 ("音频1", ASSETS["audios"][0]["url"])]
+    for token in ("图片4", "@图片9", "图0", "@视频5", "视0", "@音频3", "音0"):
+        assert token in bound
+    assert "<script>" not in bound and "&lt;script&gt;" in bound
+
+
+@pytest.mark.parametrize("token", ["Image4", "@图4", "图0", "@Video5", "v0", "@Audio3", "音0"])
+def test_strict_mode_rejects_out_of_range_numbered_references(token):
+    with pytest.raises(ValueError, match="only"):
+        prompt_references(token, ASSETS, strict_prompt_media_references=True)
+    with pytest.raises(ValueError, match="unbound"):
+        bind_prompt(token, ASSETS, strict_prompt_media_references=True)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_valid_numbered_references_bind_identically_in_both_modes(strict):
+    prompt = "Image2 @v3 Audio1"
+    assert prompt_references(prompt, ASSETS, strict_prompt_media_references=strict) == [
+        ("images", 2), ("videos", 3), ("audios", 1)]
+    parsed = References()
+    parsed.feed(bind_prompt(prompt, ASSETS, strict_prompt_media_references=strict))
+    assert parsed.references == [("图片2", ASSETS["images"][1]["url"]),
+                                 ("视频3", ASSETS["videos"][2]["url"]),
+                                 ("音频1", ASSETS["audios"][0]["url"])]
+
+
+def test_loose_mode_keeps_explicit_and_zero_references_without_that_media_kind():
+    empty = {kind: [] for kind in ASSETS}
+    prompt = "@Image1 图0 @video9 视0 @Audio2 音0"
+    assert prompt_references(prompt, empty) == []
+    assert bind_prompt(prompt, empty) == "<p>" + prompt + "</p>"
+    with pytest.raises(ValueError, match="only 0 images"):
+        prompt_references(prompt, empty, strict_prompt_media_references=True)
+    with pytest.raises(ValueError, match="unbound"):
+        bind_prompt(prompt, empty, strict_prompt_media_references=True)
+    assert bind_prompt("视频1是一个章节", empty, strict_prompt_media_references=True) == "<p>视频1是一个章节</p>"
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_exact_source_url_never_hides_a_missing_uploaded_receipt(strict):
+    source = "https://source.example.test/source.png"
+    empty = {kind: [] for kind in ASSETS}
+    sources = {**empty, "images": [source]}
+    with pytest.raises(ValueError, match="unbound"):
+        bind_prompt(source, empty, sources=sources, strict_prompt_media_references=strict)
+
+
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("token", ["Image2", "@Image2"])
+def test_valid_source_number_never_hides_a_missing_uploaded_receipt(strict, token):
+    sources = {"images": ["https://source.example.test/1.png", "https://source.example.test/2.png"],
+               "videos": [], "audios": []}
+    assets = {"images": [{"url": "https://uploaded.example.test/1.png"}], "videos": [], "audios": []}
+    with pytest.raises(ValueError, match="unbound"):
+        bind_prompt(token, assets, sources=sources, strict_prompt_media_references=strict)
+
+
+@pytest.mark.parametrize("token", ["Image2", "@Image2"])
+def test_source_count_bounds_numbered_references_even_with_extra_upload_receipts(token):
+    sources = {"images": ["https://source.example.test/1.png"], "videos": [], "audios": []}
+    assets = {"images": [{"url": "https://uploaded.example.test/1.png"},
+                         {"url": "https://uploaded.example.test/2.png"}], "videos": [], "audios": []}
+    assert bind_prompt(token, assets, sources=sources) == "<p>" + token + "</p>"
+    with pytest.raises(ValueError, match="unbound"):
+        bind_prompt(token, assets, sources=sources, strict_prompt_media_references=True)
+
+
+def test_admin_reference_setting_is_snapshotted_and_caller_cannot_override_it():
+    body = {"prompt": "Image1 @Image99", "image_urls": ["https://source.example.test/i.png"],
+            "strict_prompt_media_references": True}
+    loose = normalize_request(body)
+    assert loose["strict_prompt_media_references"] is False
+    assert loose["prompt"] == body["prompt"] and body["strict_prompt_media_references"] is True
+    with pytest.raises(ValueError, match="only 1 images"):
+        normalize_request({**body, "strict_prompt_media_references": False}, strict_prompt_media_references=True)
+    strict = normalize_request({**body, "prompt": "Image1", "strict_prompt_media_references": False},
+                               strict_prompt_media_references=True)
+    assert strict["strict_prompt_media_references"] is True
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_reference_setting_does_not_relax_actual_media_capabilities(strict):
+    with pytest.raises(ValueError, match="at most 9 images"):
+        normalize_request({"prompt": "@Image99", "image_urls": ["https://source.example.test/i.png"] * 10},
+                          strict_prompt_media_references=strict)
+    with pytest.raises(ValueError, match="at most 0 audios"):
+        normalize_request({"model": "kling-4.0", "prompt": "@Audio99", "audio_urls": ["https://source.example.test/a.mp3"]},
+                          strict_prompt_media_references=strict)
 
 
 def test_explicit_inline_video_is_deduplicated_and_existing_image_rebound():
