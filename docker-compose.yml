@@ -1,0 +1,32 @@
+services:
+  nad2api:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_NAMESPACE:-aifoxmans}/${IMAGE_NAME:-nad2api}:${IMAGE_TAG:-pre}
+    container_name: nad2api
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+      NAD_DATA_DIR: /app/data
+      NAD_CHROME_EXECUTABLE: /usr/bin/chromium
+      NAD_CHROME_USER_DATA_ROOT: /app/data/chrome-profiles
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    volumes:
+      - ./data:/app/data
+    shm_size: 512mb
+    ports:
+      - "${NAD2API_PORT:-8816}:8816"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8816/health',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    networks:
+      - my-shared-net
+
+networks:
+  my-shared-net:
+    external: true
